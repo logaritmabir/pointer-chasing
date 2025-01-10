@@ -20,7 +20,26 @@
 
 __device__ __constant__ int32_t d_const_data[MAX_CONSTANT_MEMORY_ELEMENTS];
 
-__global__ void constant_memory_latency(int32_t* dummy, float* d_const_delay) {
+__global__ void const_latency_random(int32_t* dummy, unsigned int seed, int32_t data_length, float* d_const_delay_random) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	curandState state;
+	curand_init(seed + idx, 0, 0, &state);
+	int32_t start_idx = curand(&state) % data_length;
+
+	int32_t result = 0;
+
+	clock_t start = clock();
+	for (int i = 0; i < ITERATIONS; i++) {
+		start_idx = d_const_data[start_idx];
+		result += start_idx;
+	}
+	clock_t end = clock();
+	dummy[idx] = result;
+	d_const_delay_random[idx] = static_cast<float>(end - start) / static_cast<float>(ITERATIONS);
+}
+
+__global__ void const_latency_broadcast(int32_t* dummy, float* d_const_delay) {
 	int idx = blockIdx.x * blockDim.x + threadIdx.x;
 	int32_t value = 0;
 	int32_t result = 0;
@@ -109,15 +128,15 @@ int main() {
 	int32_t* h_data, * h_const_data, * h_dummy;
 	int32_t* d_data, * d_dummy;
 
-	float* h_dram_delay_random, * h_dram_delay_broadcast, * h_reg_delay, * h_const_delay;
-	float* d_dram_delay_random, * d_dram_delay_broadcast, * d_reg_delay, * d_const_delay;
+	float* h_dram_delay_random, * h_dram_delay_broadcast, * h_reg_delay, * h_const_delay_broadcast, * h_const_delay_random;
+	float* d_dram_delay_random, * d_dram_delay_broadcast, * d_reg_delay, * d_const_delay_broadcast, * d_const_delay_random;
 
-	CHECK_CUDA_ERROR(cudaMalloc(&d_data, data_length * sizeof(int32_t)), "Failed to allocate data");
-	CHECK_CUDA_ERROR(cudaMalloc(&d_dummy, TOTAL_THREADS * sizeof(int32_t)), "Failed to allocate dummy");
-	CHECK_CUDA_ERROR(cudaMalloc(&d_dram_delay_random, TOTAL_THREADS * sizeof(float)), "Failed to allocate dram_delay_random");
-	CHECK_CUDA_ERROR(cudaMalloc(&d_dram_delay_broadcast, TOTAL_THREADS * sizeof(float)), "Failed to allocate dram_delay_broadcast");
-	CHECK_CUDA_ERROR(cudaMalloc(&d_reg_delay, TOTAL_THREADS * sizeof(float)), "Failed to allocate reg_delay");
-	CHECK_CUDA_ERROR(cudaMalloc(&d_const_delay, TOTAL_THREADS * sizeof(float)), "Failed to allocate const_delay");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dummy, TOTAL_THREADS * sizeof(int32_t)), "Failed to allocate d_dummy");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dram_delay_random, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_dram_delay_random");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dram_delay_broadcast, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_dram_delay_broadcast");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_reg_delay, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_reg_delay");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_const_delay_broadcast, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_const_delay_broadcast");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_const_delay_random, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_const_delay_random");
 
 	h_data = new int32_t[data_length];
 	for (int i = 0; i < data_length; i++) {
@@ -133,42 +152,61 @@ int main() {
 	h_dram_delay_random = new float[TOTAL_THREADS];
 	h_dram_delay_broadcast = new float[TOTAL_THREADS];
 	h_reg_delay = new float[TOTAL_THREADS];
-	h_const_delay = new float[TOTAL_THREADS];
+	h_const_delay_broadcast = new float[TOTAL_THREADS];
+	h_const_delay_random = new float[TOTAL_THREADS];
 
 	CHECK_CUDA_ERROR(cudaMemcpy(d_dummy, h_dummy, TOTAL_THREADS * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to copy h_dummy HtoD");
 	CHECK_CUDA_ERROR(cudaMemcpyToSymbol(d_const_data, h_const_data, MAX_CONSTANT_MEMORY_ELEMENTS * sizeof(int32_t)), "Failed to copy const_data HtoD");
-	constant_memory_latency << <BLOCKS, THREAD_PER_BLOCK >> > (d_dummy, d_const_delay);
+	const_latency_broadcast << <BLOCKS, THREAD_PER_BLOCK >> > (d_dummy, d_const_delay_broadcast);
 	CHECK_CUDA_ERROR(cudaGetLastError(), "constant_memory_latency launch failed");
-	CHECK_CUDA_ERROR(cudaMemcpy(h_const_delay, d_const_delay, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy const_delay DtoH");
+	CHECK_CUDA_ERROR(cudaMemcpy(h_const_delay_broadcast, d_const_delay_broadcast, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy const_delay DtoH");
+	CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
+
+	CHECK_CUDA_ERROR(cudaMalloc(&d_data, data_length * sizeof(int32_t)), "Failed to allocate data");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dummy, TOTAL_THREADS * sizeof(int32_t)), "Failed to allocate dummy");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dram_delay_random, TOTAL_THREADS * sizeof(float)), "Failed to allocate dram_delay_random");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_data, h_data, data_length * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to copy h_data HtoD");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_dummy, h_dummy, TOTAL_THREADS * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to copy h_dummy HtoD");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_dram_delay_random, h_dram_delay_random, TOTAL_THREADS * sizeof(float), cudaMemcpyHostToDevice), "Failed to copy h_dram_delay_random HtoD");
+	unsigned int seed = static_cast<unsigned int>(time(NULL));
+	dram_latency_random << <BLOCKS, THREAD_PER_BLOCK >> > (d_data, d_dummy, seed, data_length, d_dram_delay_random);
+	CHECK_CUDA_ERROR(cudaGetLastError(), "dram_latency_random launch failed");
+	CHECK_CUDA_ERROR(cudaDeviceSynchronize(), "dram_latency_random execution failed");
+	CHECK_CUDA_ERROR(cudaMemcpy(h_dram_delay_random, d_dram_delay_random, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy dram_delay_random DtoH");
+	CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
+
+	CHECK_CUDA_ERROR(cudaMalloc(&d_data, data_length * sizeof(int32_t)), "Failed to allocate d_data");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dummy, TOTAL_THREADS * sizeof(int32_t)), "Failed to allocate d_dummy");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dram_delay_broadcast, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_dram_delay_broadcast");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_data, h_data, data_length * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to allocate d_data");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_dummy, h_dummy, TOTAL_THREADS * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to allocate d_dummy");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_dram_delay_broadcast, h_dram_delay_broadcast, TOTAL_THREADS * sizeof(float), cudaMemcpyHostToDevice), "Failed to allocate d_dram_delay_broadcast");
+	dram_latency_broadcast << <BLOCKS, THREAD_PER_BLOCK >> > (d_data, d_dummy, d_dram_delay_broadcast);
+	CHECK_CUDA_ERROR(cudaGetLastError(), "dram_latency_broadcast launch failed");
+	CHECK_CUDA_ERROR(cudaDeviceSynchronize(), "dram_latency_broadcast execution failed");
+	CHECK_CUDA_ERROR(cudaMemcpy(h_dram_delay_broadcast, d_dram_delay_broadcast, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy dram_delay_broadcast DtoH");
+	CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
+
+	CHECK_CUDA_ERROR(cudaMalloc(&d_dummy, TOTAL_THREADS * sizeof(int32_t)), "Failed to allocate d_dummy");
+	CHECK_CUDA_ERROR(cudaMalloc(&d_const_delay_random, TOTAL_THREADS * sizeof(float)), "Failed to allocate d_const_delay_random");
+	CHECK_CUDA_ERROR(cudaMemcpy(d_dummy, h_dummy, TOTAL_THREADS * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to copy h_dummy HtoD");
+	CHECK_CUDA_ERROR(cudaMemcpyToSymbol(d_const_data, h_const_data, MAX_CONSTANT_MEMORY_ELEMENTS * sizeof(int32_t)), "Failed to copy d_const_data HtoD");
+	const_latency_random << <BLOCKS, THREAD_PER_BLOCK >> > (d_dummy, 1, MAX_CONSTANT_MEMORY_ELEMENTS, d_const_delay_random);
+	CHECK_CUDA_ERROR(cudaGetLastError(), "constant_memory_latency launch failed");
+	CHECK_CUDA_ERROR(cudaMemcpy(h_const_delay_random, d_const_delay_random, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy d_const_delay_random DtoH");
 	CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
 
 
-	 //CHECK_CUDA_ERROR(cudaMemcpy(d_data, h_data, data_length * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to copy h_data HtoD");
-	 //dram_latency_broadcast<<<BLOCKS, THREAD_PER_BLOCK>>>(data, dummy);
-	 //CHECK_CUDA_ERROR(cudaGetLastError(), "dram_latency_broadcast launch failed");
-	 //CHECK_CUDA_ERROR(cudaDeviceSynchronize(), "dram_latency_broadcast execution failed");
-	 //CHECK_CUDA_ERROR(cudaMemcpy(h_dram_delay_broadcast, d_dram_delay_broadcast, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy dram_delay_broadcast DtoH");
-	 //CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
-
-	 //CHECK_CUDA_ERROR(cudaMemcpy(d_data, h_data, data_length * sizeof(int32_t), cudaMemcpyHostToDevice), "Failed to copy h_data HtoD");
-	 //unsigned int seed = static_cast<unsigned int>(time(NULL));
-	 //dram_latency_random<<<BLOCKS, THREAD_PER_BLOCK>>>(data, dummy, seed, data_length);
-	 //CHECK_CUDA_ERROR(cudaGetLastError(), "dram_latency_random launch failed");
-	 //CHECK_CUDA_ERROR(cudaDeviceSynchronize(), "dram_latency_random execution failed");
-	 //CHECK_CUDA_ERROR(cudaMemcpy(h_dram_delay_random, d_dram_delay_random, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy dram_delay_random DtoH");
-	 //CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
-
-
-	 //register_latency<<<BLOCKS, THREAD_PER_BLOCK>>>(dummy);
-	 //CHECK_CUDA_ERROR(cudaGetLastError(), "register_latency launch failed");
-	 //CHECK_CUDA_ERROR(cudaDeviceSynchronize(), "register_latency execution failed");
-	 //CHECK_CUDA_ERROR(cudaMemcpy(h_reg_delay, d_reg_delay, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy reg_delay DtoH");
+	//register_latency<<<BLOCKS, THREAD_PER_BLOCK>>>(dummy);
+	//CHECK_CUDA_ERROR(cudaGetLastError(), "register_latency launch failed");
+	//CHECK_CUDA_ERROR(cudaDeviceSynchronize(), "register_latency execution failed");
+	//CHECK_CUDA_ERROR(cudaMemcpy(h_reg_delay, d_reg_delay, TOTAL_THREADS * sizeof(float), cudaMemcpyDeviceToHost), "Failed to copy reg_delay DtoH");
 
 	std::ofstream csvFile("delay.csv");
 	if (csvFile.is_open()) {
 		for (int32_t i = 0; i < TOTAL_THREADS; i++) {
 			csvFile << h_dram_delay_random[i] << "," << h_dram_delay_broadcast[i] << "," << h_reg_delay[i]
-				<< "," << h_const_delay[i] << "\n";
+				<< "," << h_const_delay_random[i] << "," << h_const_delay_broadcast[i] << "\n";
 		}
 		csvFile << "dram_delay_random,dram_delay_broadcast,reg_delay,const_delay\n";
 		csvFile.close();
@@ -190,7 +228,7 @@ int main() {
 	delete[] h_dram_delay_random;
 	delete[] h_dram_delay_broadcast;
 	delete[] h_reg_delay;
-	delete[] h_const_delay;
+	delete[] h_const_delay_broadcast;
 
 	CHECK_CUDA_ERROR(cudaDeviceReset(), "Failed to reset device");
 
